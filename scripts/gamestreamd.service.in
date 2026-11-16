@@ -1,0 +1,10 @@
+[Unit]
+Description=gamestream - emisión en directo de juegos Vulkan (NVENC)
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/gamestreamd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,87 @@
+# Copia este fichero a ~/.config/gamestream/gamestream.conf
+# Se relee cada vez que empiezas a emitir: no hace falta reiniciar el daemon.
+
+# --- Destino ---------------------------------------------------------------
+# service = twitch | youtube | ambos | custom
+#   ambos  -> emite a Twitch y YouTube a la vez (cada uno con su conexión:
+#             si uno se cae, el otro sigue)
+service = twitch
+
+# Claves de emisión
+#   Twitch:  Panel de control > Ajustes > Emisión > Clave de emisión principal
+#   YouTube: YouTube Studio > Emitir en directo > Clave de emisión
+twitch_key = PON_AQUI_TU_CLAVE_DE_TWITCH
+youtube_key = PON_AQUI_TU_CLAVE_DE_YOUTUBE
+
+# Tasa de bits por servicio (kbps, opcional; si no, se usa "bitrate").
+# Twitch admite hasta ~6000. YouTube 1080p60 recomienda 9000-12000.
+# Si son distintas, NVENC codifica una vez por cada tasa (la GPU va sobrada).
+twitch_bitrate = 6000
+youtube_bitrate = 12000
+
+# Servidores (opcional; por defecto los globales de cada servicio)
+# twitch_server = rtmp://ingest.global-contribute.live-video.net/app
+# youtube_server = rtmp://a.rtmp.youtube.com/live2
+
+# Con service = custom: URL completa (RTMP o fichero para pruebas: ~/prueba.mkv)
+# url = rtmp://mi-servidor/live/clave
+
+# Grabar también en local mientras emites (opcional, usa la tasa más alta)
+# record = ~/Vídeos/partida.mkv
+
+# Comprueba a dónde se va a emitir (claves ocultas):  gamestreamd config
+
+# --- Vídeo -----------------------------------------------------------------
+# Resolución del stream; "auto" = la del juego. Se escala en la GPU conservando
+# la proporción (bandas negras si hace falta).
+resolution = 1920x1080
+fps = 60
+# h264 (Twitch y YouTube). hevc sólo vale si emites únicamente a YouTube
+codec = h264
+# kbps por defecto (si no pones twitch_bitrate / youtube_bitrate)
+bitrate = 6000
+# segundos entre keyframes (Twitch exige 2)
+keyint = 2
+# p1 (más rápido) ... p7 (mejor calidad). NVENC es un chip aparte: p4-p5 no afecta a los fps del juego
+preset = p4
+
+# --- Audio -----------------------------------------------------------------
+# auto = lo que suena por los altavoces (monitor de la salida por defecto)
+# none = sin audio del juego, o el nombre de una fuente de "pactl list short sources"
+audio = auto
+audio_volume = 100          # % del audio del juego en la mezcla
+audio_bitrate = 160
+# Ajuste fino de lip-sync en ms: negativo = el audio suena ANTES, positivo =
+# DESPUÉS. La latencia del sistema de sonido (se ve en el log al empezar) y la
+# deriva de reloj en emisiones largas ya se compensan solas.
+audio_delay = 0
+
+# --- Micrófono --------------------------------------------------------------
+# yes / no. Se mezcla con el audio del juego (con auriculares, para no hacer eco)
+microphone = no
+# auto = micrófono predeterminado del sistema, o un nombre de "pactl list short sources"
+microphone_device = auto
+microphone_volume = 100     # %
+
+# --- Cámara -----------------------------------------------------------------
+# yes / no. Se superpone en una esquina; si se desconecta, el directo sigue
+# sin ella y vuelve sola al reconectarla.
+camera = no
+camera_device = /dev/video0
+# Resolución pedida a la cámara (si no la admite, usa la más parecida)
+camera_capture = 640x480
+camera_fps = 30
+# Ancho en el stream, en % del ancho del vídeo (5-60)
+camera_size = 22
+# abajo-derecha | abajo-izquierda | arriba-derecha | arriba-izquierda
+camera_position = abajo-derecha
+camera_margin = 20          # px desde el borde
+camera_border = 3           # px de borde blanco (0 = sin borde)
+camera_mirror = yes         # efecto espejo, como al verte en una videollamada
+
+# --- Control ---------------------------------------------------------------
+# Atajo dentro del juego (X11/XWayland). Ej: Ctrl+Shift+F9, Ctrl+Shift+S, Alt+F9, none
+# Evita Ctrl+F12: en KDE Plasma es "Mostrar escritorio" y minimiza el juego.
+hotkey = Ctrl+Shift+F9
+# Notificación del escritorio al empezar/parar (notify-send)
+notify = yes

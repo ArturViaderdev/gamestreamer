@@ -1,0 +1,23 @@
+#!/bin/sh
+# Lanzador: activa la capa de captura para el programa que se le pasa.
+#   gamestream ./juego
+#   gamestream proton run juego.exe
+#   Steam -> Opciones de lanzamiento:  gamestream %command%
+#
+# Si gamestreamd no está en marcha, lo arranca en segundo plano.
+
+if [ $# -eq 0 ]; then
+    echo "uso: gamestream <programa> [args...]   (en Steam: gamestream %command%)" >&2
+    exit 1
+fi
+
+if command -v gamestreamd >/dev/null 2>&1 && ! gamestreamd status >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user start gamestreamd.service 2>/dev/null; then
+        :
+    else
+        nohup gamestreamd >"${XDG_RUNTIME_DIR:-/tmp}/gamestreamd.log" 2>&1 &
+    fi
+fi
+
+export GAMESTREAM=1
+exec "$@"
