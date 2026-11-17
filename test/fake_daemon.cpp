@@ -39,6 +39,12 @@ static void initVk() {
 }
 
 struct Imp { VkBuffer buf; VkDeviceMemory mem; };
+static GsStart makeStart() {
+    GsStart s{}; s.type = GS_START; s.version = GS_PROTO_VERSION; s.fps = 30; s.nstreams = 2;
+    s.width[0] = 0; s.height[0] = 0;        // salida 0: resolución del juego
+    s.width[1] = 320; s.height[1] = 180;    // salida 1: reducida (blit)
+    return s;
+}
 
 int main(int argc, char** argv) {
     bool autostart = argc > 1 && !strcmp(argv[1], "--autostart");
@@ -65,7 +71,7 @@ int main(int argc, char** argv) {
     for (int iter = 0; iter < 100000; iter++) {
         pollfd p{c, POLLIN, 0};
         if (poll(&p, 1, 8000) <= 0) { printf("timeout esperando mensajes\n"); break; }
-        char buf[GS_MAX_MSG]; char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS)];
+        char buf[GS_MAX_MSG]; char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS * GS_MAX_STREAMS)];
         iovec iov{buf, sizeof buf}; msghdr mh{}; mh.msg_iov = &iov; mh.msg_iovlen = 1; mh.msg_control = cbuf; mh.msg_controllen = sizeof cbuf;
         ssize_t n = recvmsg(c, &mh, 0);
         if (n <= 0) { printf("el juego se desconectó\n"); break; }
@@ -75,32 +81,34 @@ int main(int argc, char** argv) {
         uint32_t type; memcpy(&type, buf, 4);
         if (type == GS_HELLO) {
             GsHello h; memcpy(&h, buf, sizeof h); printf("HELLO de %s pid %d\n", h.exe, h.pid);
-            if (autostart) { GsStart s{GS_START, 640, 360, 30}; send(c, &s, sizeof s, 0); started = true; }
+            if (autostart) { GsStart s = makeStart(); send(c, &s, sizeof s, 0); started = true; }
         } else if (type == GS_TOGGLE) {
             toggles++; printf("TOGGLE recibido (hotkey)\n");
-            if (!started) { GsStart s{GS_START, 640, 360, 30}; send(c, &s, sizeof s, 0); started = true; }
+            if (!started) { GsStart s = makeStart(); send(c, &s, sizeof s, 0); started = true; }
         } else if (type == GS_TEXTURES) {
             memcpy(&tex, buf, sizeof tex); textures++;
-            printf("TEXTURES gen %u %ux%u pitch %u slots %u alloc %llu dedicated %u fds %zu\n", tex.generation, tex.width, tex.height,
-                   tex.pitch, tex.nslots, (unsigned long long)tex.alloc_size, tex.dedicated, fds.size());
+            printf("TEXTURES v%u stereo %u gen %u slots %u salidas %u fds %zu\n", tex.version, tex.stereo, tex.generation, tex.nslots, tex.nstreams, fds.size());
+            for (uint32_t k = 0; k < tex.nstreams; k++)
+                printf("  salida %u: %ux%u pitch %u alloc %llu\n", k, tex.width[k], tex.height[k], tex.pitch[k], (unsigned long long)tex.alloc_size[k]);
             imps.clear();
-            for (uint32_t i = 0; i < tex.nslots; i++) {
+            for (uint32_t i = 0; i < tex.nslots * tex.nstreams; i++) {
+                uint32_t k = i % tex.nstreams;
                 Imp im;
                 VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
                 eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
                 VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb};
-                bci.size = (VkDeviceSize)tex.pitch * tex.height; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                bci.size = (VkDeviceSize)tex.pitch[k] * tex.height[k]; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
                 CK(vkCreateBuffer(dev, &bci, nullptr, &im.buf));
                 VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, im.buf, &mr);
                 VkImportMemoryFdInfoKHR imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
                 imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT; imp.fd = fds[i];
                 VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp};
-                mai.allocationSize = tex.alloc_size; mai.memoryTypeIndex = memType(mr.memoryTypeBits, 0);
+                mai.allocationSize = tex.alloc_size[k]; mai.memoryTypeIndex = memType(mr.memoryTypeBits, 0);
                 CK(vkAllocateMemory(dev, &mai, nullptr, &im.mem));
                 CK(vkBindBufferMemory(dev, im.buf, im.mem, 0));
                 imps.push_back(im);
             }
-            stgSize = (VkDeviceSize)tex.pitch * tex.height;
+            stgSize = (VkDeviceSize)tex.pitch[0] * tex.height[0];
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bci.size = stgSize; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             CK(vkCreateBuffer(dev, &bci, nullptr, &stg));
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, stg, &mr);
@@ -113,23 +121,25 @@ int main(int argc, char** argv) {
             if (!firstTs) firstTs = f.ts_ns; lastTs = f.ts_ns;
             frames++;
             if (frames == 20 || frames == 40) {
-                VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                vkBeginCommandBuffer(cb, &bi);
-                VkBufferCopy r{0, 0, stgSize}; vkCmdCopyBuffer(cb, imps[f.slot].buf, stg, 1, &r);
-                vkEndCommandBuffer(cb);
-                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-                CK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); vkQueueWaitIdle(queue);
-                char name[64]; snprintf(name, sizeof name, "frame_%d.ppm", frames);
-                FILE* o = fopen(name, "wb"); fprintf(o, "P6\n%u %u\n255\n", tex.width, tex.height);
-                uint64_t sum = 0; int distinct = 0; uint32_t prev = 0;
-                for (uint32_t y = 0; y < tex.height; y++) for (uint32_t x = 0; x < tex.width; x++) {
-                    uint8_t* px = (uint8_t*)map + (size_t)y * tex.pitch + x * 4;   // BGRA
-                    uint8_t rgb[3] = {px[2], px[1], px[0]}; fwrite(rgb, 1, 3, o);
-                    uint32_t v = px[0] | px[1] << 8 | px[2] << 16; sum += px[0] + px[1] + px[2]; if (v != prev) distinct++; prev = v;
+                for (uint32_t k = 0; k < tex.nstreams; k++) {
+                    VkDeviceSize sz = (VkDeviceSize)tex.pitch[k] * tex.height[k];
+                    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                    vkResetCommandBuffer(cb, 0);
+                    vkBeginCommandBuffer(cb, &bi);
+                    VkBufferCopy r{0, 0, sz}; vkCmdCopyBuffer(cb, imps[f.slot * tex.nstreams + k].buf, stg, 1, &r);
+                    vkEndCommandBuffer(cb);
+                    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+                    CK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); vkQueueWaitIdle(queue);
+                    char name[64]; snprintf(name, sizeof name, "frame_%d_s%u.ppm", frames, k);
+                    FILE* o = fopen(name, "wb"); fprintf(o, "P6\n%u %u\n255\n", tex.width[k], tex.height[k]);
+                    uint64_t sum = 0;
+                    for (uint32_t y = 0; y < tex.height[k]; y++) for (uint32_t x = 0; x < tex.width[k]; x++) {
+                        uint8_t* px = (uint8_t*)map + (size_t)y * tex.pitch[k] + x * 4;   // BGRA
+                        uint8_t rgb[3] = {px[2], px[1], px[0]}; fwrite(rgb, 1, 3, o); sum += px[0] + px[1] + px[2];
+                    }
+                    fclose(o); saved++;
+                    printf("frame %d salida %u (slot %u) -> %s, brillo medio %.1f\n", frames, k, f.slot, name, sum / (3.0 * tex.width[k] * tex.height[k]));
                 }
-                fclose(o); saved++;
-                printf("frame %d (slot %u) guardado en %s, brillo medio %.1f, cambios de color %d\n", frames, f.slot, name,
-                       sum / (3.0 * tex.width * tex.height), distinct);
             }
             GsRelease rel{GS_RELEASE, f.generation, f.slot}; send(c, &rel, sizeof rel, 0);
             if (frames == 90) {
@@ -144,5 +154,5 @@ int main(int argc, char** argv) {
     usleep(500000);
     printf("RESUMEN frames=%d textures=%d toggles=%d guardados=%d\n", frames, textures, toggles, saved);
     close(c);
-    return frames >= 90 && saved == 2 ? 0 : 1;
+    return frames >= 90 && saved == 4 ? 0 : 1;
 }

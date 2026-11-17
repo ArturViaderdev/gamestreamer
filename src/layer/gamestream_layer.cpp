@@ -17,6 +17,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -233,8 +234,8 @@ private:
 enum { SLOT_FREE = 0, SLOT_GPU = 1, SLOT_DAEMON = 2 };
 
 struct Slot {
-    VkBuffer buf = VK_NULL_HANDLE;
-    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkBuffer buf[GS_MAX_STREAMS] = {};        // un buffer por resolución de salida
+    VkDeviceMemory mem[GS_MAX_STREAMS] = {};
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     std::atomic<int> state{SLOT_FREE};
@@ -340,13 +341,18 @@ public:
             if (slots_[i].state.load() == SLOT_FREE) { s = i; break; }
         if (s < 0) { dropped_++; return false; }   // el daemon va lento: se descarta, el juego no espera
 
-        const bool fast = (srcFmt == VK_FORMAT_B8G8R8A8_UNORM || srcFmt == VK_FORMAT_B8G8R8A8_SRGB) &&
-                          srcExt.width == outW_ && srcExt.height == outH_;
-        if (!fast) {
-            VkFormat want = isSrgb(srcFmt) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
-            if (interm_ && intermFmt_ != want) destroyInterm();
-            if (!interm_ && !createInterm(want)) return false;
-            if (!canBlitFrom(srcFmt)) return false;
+        // Por cada salida: copia directa si ya es BGRA del mismo tamaño; si no, blit escalado
+        bool fast[GS_MAX_STREAMS];
+        for (uint32_t k = 0; k < nstreams_; k++) {
+            Out& o = outs_[k];
+            fast[k] = (srcFmt == VK_FORMAT_B8G8R8A8_UNORM || srcFmt == VK_FORMAT_B8G8R8A8_SRGB) &&
+                      srcExt.width == o.w && srcExt.height == o.h;
+            if (!fast[k]) {
+                VkFormat want = isSrgb(srcFmt) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+                if (o.interm && o.intermFmt != want) destroyInterm(o);
+                if (!o.interm && !createInterm(o, want)) return false;
+                if (!canBlitFrom(srcFmt)) return false;
+            }
         }
         nextDue_ = std::max(nextDue_ + interval, now + interval / 2);
 
@@ -386,7 +392,7 @@ public:
 
 private:
     // ---- grabación de la copia -------------------------------------------
-    void record(Slot& sl, VkImage src, VkFormat srcFmt, VkExtent2D ext, bool fast) {
+    void record(Slot& sl, VkImage src, VkFormat srcFmt, VkExtent2D ext, const bool* fast) {
         d_->ResetCommandBuffer(sl.cb, 0);
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -407,45 +413,48 @@ private:
                 VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-        VkImage copyFrom = src;
-        if (!fast) {
-            barrier(interm_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            // Escalado conservando la proporción (bandas negras si hace falta)
-            double sc = std::min((double)outW_ / ext.width, (double)outH_ / ext.height);
-            int32_t dw = (int32_t)(ext.width * sc + 0.5), dh = (int32_t)(ext.height * sc + 0.5);
-            int32_t x0 = ((int32_t)outW_ - dw) / 2, y0 = ((int32_t)outH_ - dh) / 2;
-            if (dw != (int32_t)outW_ || dh != (int32_t)outH_) {
-                VkClearColorValue black{};
-                black.float32[3] = 1.f;
-                d_->CmdClearColorImage(sl.cb, interm_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
-                VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                d_->CmdPipelineBarrier(sl.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       0, 1, &mb, 0, nullptr, 0, nullptr);
+        const bool linear = canFilterLinear(srcFmt);
+        for (uint32_t k = 0; k < nstreams_; k++) {
+            Out& o = outs_[k];
+            VkImage copyFrom = src;
+            if (!fast[k]) {
+                barrier(o.interm, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                // Escalado conservando la proporción (bandas negras si hace falta)
+                double sc = std::min((double)o.w / ext.width, (double)o.h / ext.height);
+                int32_t dw = (int32_t)(ext.width * sc + 0.5), dh = (int32_t)(ext.height * sc + 0.5);
+                int32_t x0 = ((int32_t)o.w - dw) / 2, y0 = ((int32_t)o.h - dh) / 2;
+                if (dw != (int32_t)o.w || dh != (int32_t)o.h) {
+                    VkClearColorValue black{};
+                    black.float32[3] = 1.f;
+                    d_->CmdClearColorImage(sl.cb, o.interm, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+                    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    d_->CmdPipelineBarrier(sl.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           0, 1, &mb, 0, nullptr, 0, nullptr);
+                }
+                VkImageBlit blit{};
+                blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                blit.srcOffsets[1] = {(int32_t)ext.width, (int32_t)ext.height, 1};
+                blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                blit.dstOffsets[0] = {x0, y0, 0};
+                blit.dstOffsets[1] = {x0 + dw, y0 + dh, 1};
+                d_->CmdBlitImage(sl.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 o.interm, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                                 linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+                barrier(o.interm, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                copyFrom = o.interm;
             }
-            VkImageBlit blit{};
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            blit.srcOffsets[1] = {(int32_t)ext.width, (int32_t)ext.height, 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            blit.dstOffsets[0] = {x0, y0, 0};
-            blit.dstOffsets[1] = {x0 + dw, y0 + dh, 1};
-            d_->CmdBlitImage(sl.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                             interm_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                             canFilterLinear(srcFmt) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-            barrier(interm_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            copyFrom = interm_;
+            VkBufferImageCopy region{};
+            region.bufferRowLength = o.pitch / 4;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {o.w, o.h, 1};
+            d_->CmdCopyImageToBuffer(sl.cb, copyFrom, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sl.buf[k], 1, &region);
         }
-
-        VkBufferImageCopy region{};
-        region.bufferRowLength = pitch_ / 4;
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {outW_, outH_, 1};
-        d_->CmdCopyImageToBuffer(sl.cb, copyFrom, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sl.buf, 1, &region);
 
         barrier(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_ACCESS_TRANSFER_READ_BIT, 0,
@@ -480,10 +489,14 @@ private:
     // ---- recursos ----------------------------------------------------------
     bool create(uint32_t fam, VkExtent2D ext) {
         std::lock_guard<std::mutex> l(resMtx_);
-        uint32_t w = reqW_, h = reqH_;
-        if (!w || !h) { w = ext.width; h = ext.height; }
-        outW_ = w & ~1u; outH_ = h & ~1u;           // NVENC quiere dimensiones pares
-        pitch_ = (outW_ * 4 + 255) & ~255u;
+        nstreams_ = std::clamp<uint32_t>(reqStreams_, 1, GS_MAX_STREAMS);
+        for (uint32_t k = 0; k < nstreams_; k++) {
+            uint32_t w = reqW_[k], h = reqH_[k];
+            if (!w || !h) { w = ext.width; h = ext.height; }   // 0x0 = resolución del juego
+            Out& o = outs_[k];
+            o.w = w & ~1u; o.h = h & ~1u;                      // NVENC quiere dimensiones pares
+            o.pitch = (o.w * 4 + 255) & ~255u;
+        }
         fps_ = reqFps_;
         nslots_ = 4;
         family_ = fam;
@@ -493,7 +506,7 @@ private:
         pci.queueFamilyIndex = fam;
         if (d_->CreateCommandPool(d_->device, &pci, nullptr, &pool_) != VK_SUCCESS) { destroyAll(); return false; }
 
-        std::vector<int> fds;
+        std::vector<int> fds;   // fd[slot * nstreams + stream]
         bool ok = true;
         for (uint32_t i = 0; i < nslots_ && ok; i++) {
             Slot& s = slots_[i];
@@ -506,48 +519,59 @@ private:
             if (d_->setLoaderData) d_->setLoaderData(d_->device, s.cb);
             else *(void**)s.cb = *(void**)d_->device;
 
-            VkExternalMemoryBufferCreateInfo ebi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
-            ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ebi};
-            bci.size = (VkDeviceSize)pitch_ * outH_;
-            bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            ok = d_->CreateBuffer(d_->device, &bci, nullptr, &s.buf) == VK_SUCCESS;
-            if (!ok) break;
-            VkMemoryRequirements mr;
-            d_->GetBufferMemoryRequirements(d_->device, s.buf, &mr);
-            int mt = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
-            ded.buffer = s.buf;
-            VkExportMemoryAllocateInfo exp{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-                                           d_->exportDedicatedOnly ? (void*)&ded : nullptr};
-            exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp};
-            mai.allocationSize = mr.size;
-            mai.memoryTypeIndex = (uint32_t)mt;
-            ok = mt >= 0 && d_->AllocateMemory(d_->device, &mai, nullptr, &s.mem) == VK_SUCCESS;
-            if (!ok) break;
-            allocSize_ = mr.size;
-            ok = d_->BindBufferMemory(d_->device, s.buf, s.mem, 0) == VK_SUCCESS;
+            for (uint32_t k = 0; k < nstreams_ && ok; k++) {
+                Out& o = outs_[k];
+                VkExternalMemoryBufferCreateInfo ebi{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+                ebi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ebi};
+                bci.size = (VkDeviceSize)o.pitch * o.h;
+                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                ok = d_->CreateBuffer(d_->device, &bci, nullptr, &s.buf[k]) == VK_SUCCESS;
+                if (!ok) break;
+                VkMemoryRequirements mr;
+                d_->GetBufferMemoryRequirements(d_->device, s.buf[k], &mr);
+                int mt = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+                ded.buffer = s.buf[k];
+                VkExportMemoryAllocateInfo exp{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                                               d_->exportDedicatedOnly ? (void*)&ded : nullptr};
+                exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp};
+                mai.allocationSize = mr.size;
+                mai.memoryTypeIndex = (uint32_t)mt;
+                ok = mt >= 0 && d_->AllocateMemory(d_->device, &mai, nullptr, &s.mem[k]) == VK_SUCCESS;
+                if (!ok) break;
+                o.alloc = mr.size;
+                ok = d_->BindBufferMemory(d_->device, s.buf[k], s.mem[k], 0) == VK_SUCCESS;
+                if (!ok) break;
+                VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+                gi.memory = s.mem[k];
+                gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                int fd = -1;
+                ok = d_->GetMemoryFdKHR(d_->device, &gi, &fd) == VK_SUCCESS && fd >= 0;
+                if (ok) fds.push_back(fd);
+            }
             if (!ok) break;
             VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             ok = d_->CreateFence(d_->device, &fci, nullptr, &s.fence) == VK_SUCCESS;
-            if (!ok) break;
-            VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
-            gi.memory = s.mem;
-            gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-            int fd = -1;
-            ok = d_->GetMemoryFdKHR(d_->device, &gi, &fd) == VK_SUCCESS && fd >= 0;
-            if (ok) fds.push_back(fd);
             s.state = SLOT_FREE;
         }
+        std::string sizes;
         if (ok) {
             GsTextures t{};
             t.type = GS_TEXTURES;
+            t.version = GS_PROTO_VERSION;
             t.generation = ++gen_;
-            t.width = outW_; t.height = outH_; t.pitch = pitch_;
             t.nslots = nslots_;
-            t.alloc_size = allocSize_;
+            t.nstreams = nstreams_;
+            for (uint32_t k = 0; k < nstreams_; k++) {
+                t.width[k] = outs_[k].w;
+                t.height[k] = outs_[k].h;
+                t.pitch[k] = outs_[k].pitch;
+                t.alloc_size[k] = outs_[k].alloc;
+                sizes += (sizes.empty() ? "" : " + ") + std::to_string(outs_[k].w) + "x" + std::to_string(outs_[k].h);
+            }
             t.dedicated = d_->exportDedicatedOnly;
             t.has_uuid = d_->hasUuid;
             memcpy(t.device_uuid, d_->uuid, 16);
@@ -560,55 +584,66 @@ private:
         valid_ = true;
         resSession_ = session_.load();
         nextDue_ = 0;
-        LOG("capturando %ux%u @ %u fps (%u buffers en VRAM)", outW_, outH_, fps_, nslots_);
+        LOG("capturando %s @ %u fps (%u buffers en VRAM por salida)", sizes.c_str(), fps_, nslots_);
         return true;
     }
 
-    bool createInterm(VkFormat fmt) {
+    struct Out {
+        uint32_t w = 0, h = 0, pitch = 0;
+        VkDeviceSize alloc = 0;
+        VkImage interm = VK_NULL_HANDLE;   // imagen intermedia para escalar/convertir
+        VkDeviceMemory intermMem = VK_NULL_HANDLE;
+        VkFormat intermFmt = VK_FORMAT_UNDEFINED;
+    };
+
+    bool createInterm(Out& o, VkFormat fmt) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = fmt;
-        ici.extent = {outW_, outH_, 1};
+        ici.extent = {o.w, o.h, 1};
         ici.mipLevels = ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
         ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (d_->CreateImage(d_->device, &ici, nullptr, &interm_) != VK_SUCCESS) { interm_ = VK_NULL_HANDLE; return false; }
+        if (d_->CreateImage(d_->device, &ici, nullptr, &o.interm) != VK_SUCCESS) { o.interm = VK_NULL_HANDLE; return false; }
         VkMemoryRequirements mr;
-        d_->GetImageMemoryRequirements(d_->device, interm_, &mr);
+        d_->GetImageMemoryRequirements(d_->device, o.interm, &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = mr.size;
         int mt = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         mai.memoryTypeIndex = (uint32_t)mt;
-        if (mt < 0 || d_->AllocateMemory(d_->device, &mai, nullptr, &intermMem_) != VK_SUCCESS ||
-            d_->BindImageMemory(d_->device, interm_, intermMem_, 0) != VK_SUCCESS) {
-            destroyInterm();
+        if (mt < 0 || d_->AllocateMemory(d_->device, &mai, nullptr, &o.intermMem) != VK_SUCCESS ||
+            d_->BindImageMemory(d_->device, o.interm, o.intermMem, 0) != VK_SUCCESS) {
+            destroyInterm(o);
             return false;
         }
-        intermFmt_ = fmt;
+        o.intermFmt = fmt;
         return true;
     }
-    void destroyInterm() {
-        if (interm_) d_->DestroyImage(d_->device, interm_, nullptr);
-        if (intermMem_) d_->FreeMemory(d_->device, intermMem_, nullptr);
-        interm_ = VK_NULL_HANDLE; intermMem_ = VK_NULL_HANDLE; intermFmt_ = VK_FORMAT_UNDEFINED;
+    void destroyInterm(Out& o) {
+        if (o.interm) d_->DestroyImage(d_->device, o.interm, nullptr);
+        if (o.intermMem) d_->FreeMemory(d_->device, o.intermMem, nullptr);
+        o.interm = VK_NULL_HANDLE; o.intermMem = VK_NULL_HANDLE; o.intermFmt = VK_FORMAT_UNDEFINED;
     }
 
     // Sólo si ninguna copia está en vuelo. Llamar con resMtx_ cogido.
     void destroyAll() {
         for (uint32_t i = 0; i < GS_MAX_SLOTS; i++) {
             Slot& s = slots_[i];
-            if (s.buf) d_->DestroyBuffer(d_->device, s.buf, nullptr);
-            if (s.mem) d_->FreeMemory(d_->device, s.mem, nullptr);   // el daemon conserva su propia referencia
+            for (uint32_t k = 0; k < GS_MAX_STREAMS; k++) {
+                if (s.buf[k]) d_->DestroyBuffer(d_->device, s.buf[k], nullptr);
+                if (s.mem[k]) d_->FreeMemory(d_->device, s.mem[k], nullptr);   // el daemon conserva su propia referencia
+                s.buf[k] = VK_NULL_HANDLE; s.mem[k] = VK_NULL_HANDLE;
+            }
             if (s.fence) d_->DestroyFence(d_->device, s.fence, nullptr);
             if (s.cb) d_->FreeCommandBuffers(d_->device, pool_, 1, &s.cb);
-            s.buf = VK_NULL_HANDLE; s.mem = VK_NULL_HANDLE; s.fence = VK_NULL_HANDLE; s.cb = VK_NULL_HANDLE;
+            s.fence = VK_NULL_HANDLE; s.cb = VK_NULL_HANDLE;
             s.state = SLOT_FREE;
         }
         if (pool_) d_->DestroyCommandPool(d_->device, pool_, nullptr);
         pool_ = VK_NULL_HANDLE;
-        destroyInterm();
+        for (auto& o : outs_) destroyInterm(o);
         valid_ = false;
     }
     bool tryDestroy() {
@@ -629,7 +664,7 @@ private:
         msghdr mh{};
         mh.msg_iov = &iov;
         mh.msg_iovlen = 1;
-        char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS)];
+        char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS * GS_MAX_STREAMS)];
         if (nfds > 0) {
             memset(cbuf, 0, sizeof cbuf);
             mh.msg_control = cbuf;
@@ -700,7 +735,13 @@ private:
             if (n >= (ssize_t)sizeof(GsStart)) {
                 GsStart s;
                 memcpy(&s, buf, sizeof s);
-                reqW_ = s.width; reqH_ = s.height; reqFps_ = s.fps ? s.fps : 60;
+                if (s.version != GS_PROTO_VERSION) {
+                    LOG("versión de gamestreamd distinta de la de la capa: reinstala gamestream (./install.sh)");
+                    break;
+                }
+                reqStreams_ = std::clamp<uint32_t>(s.nstreams, 1, GS_MAX_STREAMS);
+                for (uint32_t k = 0; k < GS_MAX_STREAMS; k++) { reqW_[k] = s.width[k]; reqH_[k] = s.height[k]; }
+                reqFps_ = s.fps ? s.fps : 60;
                 session_++;
                 wantCapture_ = true;
                 LOG("inicio de emisión pedido por el daemon");
@@ -795,7 +836,8 @@ private:
     int sock_ = -1;
 
     std::atomic<bool> wantCapture_{false};
-    std::atomic<uint32_t> reqW_{0}, reqH_{0}, reqFps_{60};
+    // pedido por el daemon (se aplica al crear recursos, en el hilo del present)
+    std::atomic<uint32_t> reqW_[GS_MAX_STREAMS]{}, reqH_[GS_MAX_STREAMS]{}, reqStreams_{1}, reqFps_{60};
     std::atomic<uint32_t> session_{0};
 
     std::mutex resMtx_;
@@ -803,13 +845,10 @@ private:
     uint32_t resSession_ = 0;
     uint32_t family_ = 0;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    uint32_t outW_ = 0, outH_ = 0, pitch_ = 0, fps_ = 60, nslots_ = 4;
-    VkDeviceSize allocSize_ = 0;
+    uint32_t fps_ = 60, nslots_ = 4, nstreams_ = 1;
+    Out outs_[GS_MAX_STREAMS];
     Slot slots_[GS_MAX_SLOTS];
     std::atomic<uint32_t> gen_{0};
-    VkImage interm_ = VK_NULL_HANDLE;
-    VkDeviceMemory intermMem_ = VK_NULL_HANDLE;
-    VkFormat intermFmt_ = VK_FORMAT_UNDEFINED;
     std::unordered_map<int, bool> blitCache_;
 
     std::vector<VkSemaphore> sems_;

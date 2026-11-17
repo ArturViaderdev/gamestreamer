@@ -145,12 +145,19 @@ struct CameraOptions {
     std::string position = "abajo-derecha";
     int margin = 20, border = 3;
     bool mirror = true;
-    int stereo = 0;   // 0 = 2D, 1 = half SBS, 2 = full SBS: la cámara se pone en los dos ojos
+    int stereo = 0;   // 0 = 2D, 1 = half SBS, 2 = full SBS (3D Vision): la cámara se pone en los dos ojos
 };
 
 class CameraOverlay : public Overlay {
 public:
-    CameraOverlay(const CameraOptions& o, int streamW, int streamH) : o_(o), sw_(streamW), sh_(streamH) {
+    // sizes: resoluciones de salida; la cámara se prepara a la medida de cada una
+    CameraOverlay(const CameraOptions& o, const std::vector<std::pair<int, int>>& sizes) : o_(o) {
+        for (auto& sz : sizes) {
+            Target t;
+            t.sw = sz.first;
+            t.sh = sz.second;
+            targets_.push_back(std::move(t));
+        }
         thr_ = std::thread(&CameraOverlay::loop, this);
     }
     ~CameraOverlay() override {
@@ -162,28 +169,36 @@ public:
     // En 3D lado a lado, en la misma esquina de cada ojo (a la profundidad de la pantalla).
     void apply(CUdeviceptr frame, size_t pitch, int w, int h, CUstream stream) override {
         std::lock_guard<std::mutex> l(m_);
+        if (!have_) return;
+        Target* t = nullptr;
+        for (auto& tg : targets_) if (tg.sw == w && tg.sh == h) t = &tg;
+        if (!t) return;
+        const int margin = o_.margin * w / std::max(1, maxW_);   // margen proporcional en salidas menores
         if (o_.stereo) {
-            int hw = w / 2, mx = o_.stereo == 1 ? o_.margin / 2 : o_.margin;
-            place(frame, pitch, hw, h, mx, stream);
-            place(frame + (size_t)hw * 4, pitch, hw, h, mx, stream);
+            const int hw = w / 2, mx = o_.stereo == 1 ? margin / 2 : margin;
+            place(*t, frame, pitch, hw, h, mx, margin, stream);
+            place(*t, frame + (size_t)hw * 4, pitch, hw, h, mx, margin, stream);
         } else
-            place(frame, pitch, w, h, o_.margin, stream);
+            place(*t, frame, pitch, w, h, margin, margin, stream);
     }
 
 private:
-    void place(CUdeviceptr frame, size_t pitch, int w, int h, int mx, CUstream stream) {
-        if (!have_ || ow_ > w || oh_ > h) return;
-        int x = mx, y = o_.margin;
+    struct Target;
+    void place(Target& tg, CUdeviceptr frame, size_t pitch, int w, int h, int mx, int my, CUstream stream) {
+        Target* t = &tg;
+        if (t->ow > w || t->oh > h) return;
+        const int ow_ = t->ow, oh_ = t->oh;
+        int x = mx, y = my;
         const std::string& p = o_.position;
         bool right = p.find("derech") != std::string::npos || p.find("right") != std::string::npos;
         bool bottom = p.find("abajo") != std::string::npos || p.find("bottom") != std::string::npos;
         if (right) x = w - ow_ - mx;
-        if (bottom) y = h - oh_ - o_.margin;
+        if (bottom) y = h - oh_ - my;
         x = std::clamp(x, 0, w - ow_);
         y = std::clamp(y, 0, h - oh_);
         CUDA_MEMCPY2D cp{};
         cp.srcMemoryType = CU_MEMORYTYPE_HOST;
-        cp.srcHost = img_.data();
+        cp.srcHost = t->img.data();
         cp.srcPitch = (size_t)ow_ * 4;
         cp.dstMemoryType = CU_MEMORYTYPE_DEVICE;
         cp.dstDevice = frame + (size_t)y * pitch + (size_t)x * 4;
@@ -242,24 +257,30 @@ private:
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) return fail("VIDIOC_STREAMON falló (¿la usa otro programa?)");
 
-        // tamaño en el stream: % del ancho, conservando la proporción de la cámara
-        // en 3D, % del ancho de un ojo tal como se ve (half SBS: el ojo se estira al doble, así que la
-        // imagen se guarda comprimida a la mitad de ancho para que al verla tenga su proporción)
-        int eyeW = o_.stereo == 2 ? sw_ / 2 : sw_;
-        int ow = std::max(16, (eyeW * o_.sizePct / 100) & ~1);
-        int oh = std::max(16, (ow * capH_ / capW_) & ~1);
-        if (oh > sh_ / 2) { oh = (sh_ / 2) & ~1; ow = (oh * capW_ / capH_) & ~1; }
-        if (o_.stereo == 1) ow = std::max(8, (ow / 2) & ~1);
+        // tamaño en cada salida: % de su ancho, conservando la proporción de la cámara
+        std::string dims;
         {
             std::lock_guard<std::mutex> l(m_);
-            ow_ = ow;
-            oh_ = oh;
-            img_.assign((size_t)ow * oh * 4, 0);
+            maxW_ = 1;
+            for (auto& t : targets_) {
+                maxW_ = std::max(maxW_, t.sw);
+                // en 3D, % del ancho de un ojo tal como se ve (half SBS: el ojo se estira al doble, así que la
+                // imagen se guarda comprimida a la mitad de ancho para que al verla tenga su proporción)
+                const int eyeW = o_.stereo == 2 ? t.sw / 2 : t.sw;
+                int ow = std::max(16, (eyeW * o_.sizePct / 100) & ~1);
+                int oh = std::max(16, (ow * capH_ / capW_) & ~1);
+                if (oh > t.sh / 2) { oh = (t.sh / 2) & ~1; ow = (oh * capW_ / capH_) & ~1; }
+                if (o_.stereo == 1) ow = std::max(8, (ow / 2) & ~1);
+                t.ow = ow;
+                t.oh = oh;
+                t.img.assign((size_t)ow * oh * 4, 0);
+                t.work.assign((size_t)ow * oh * 4, 0);
+                dims += (dims.empty() ? "" : " / ") + std::to_string(ow) + "x" + std::to_string(oh);
+            }
             have_ = false;
         }
-        work_.assign((size_t)ow * oh * 4, 0);
-        LOG("cámara: %s %dx%d %s -> %dx%d en %s%s", o_.device.c_str(), capW_, capH_, mjpeg_ ? "MJPEG" : "YUYV", ow, oh,
-            o_.position.c_str(), o_.stereo ? " (3D: en los dos ojos)" : "");
+        LOG("cámara: %s %dx%d %s -> %s en %s%s", o_.device.c_str(), capW_, capH_, mjpeg_ ? "MJPEG" : "YUYV",
+            dims.c_str(), o_.position.c_str(), o_.stereo ? " (3D: en los dos ojos)" : "");
         lastError_.clear();
         return true;
     }
@@ -295,15 +316,13 @@ private:
             v.p[0] = data;
             v.stride[0] = stride_;
         }
-        int ow, oh;
-        {
-            std::lock_guard<std::mutex> l(m_);
-            ow = ow_;
-            oh = oh_;
+        // targets_ sólo cambia de tamaño en openDev (este mismo hilo): se puede convertir sin el lock
+        for (auto& t : targets_) {
+            int border = std::max(o_.border > 0 ? 1 : 0, o_.border * t.sw / std::max(1, maxW_));
+            yuvToBgra(v, t.work.data(), t.ow, t.oh, t.ow * 4, o_.mirror, border);
         }
-        yuvToBgra(v, work_.data(), ow, oh, ow * 4, o_.mirror, o_.border);
         std::lock_guard<std::mutex> l(m_);
-        img_.swap(work_);
+        for (auto& t : targets_) t.img.swap(t.work);
         have_ = true;
     }
 
@@ -339,8 +358,14 @@ private:
         closeDev();
     }
 
+    struct Target {
+        int sw = 0, sh = 0;   // resolución de la salida
+        int ow = 0, oh = 0;   // tamaño de la cámara en esa salida
+        std::vector<uint8_t> img, work;
+    };
     CameraOptions o_;
-    int sw_, sh_;
+    std::vector<Target> targets_;
+    int maxW_ = 1;
     std::thread thr_;
     std::atomic<bool> quit_{false};
     int fd_ = -1;
@@ -351,8 +376,6 @@ private:
     std::string lastError_;
 
     std::mutex m_;
-    std::vector<uint8_t> img_, work_;
-    int ow_ = 0, oh_ = 0;
     bool have_ = false;
 };
 #endif

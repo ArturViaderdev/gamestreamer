@@ -19,6 +19,15 @@ youtube_key = PON_AQUI_TU_CLAVE_DE_YOUTUBE
 twitch_bitrate = 6000
 youtube_bitrate = 12000
 
+# Resolución y códec por servicio (opcional; si no, se usan "resolution" y "codec").
+# Ejemplo: 4K en YouTube y 1080p en Twitch a la vez. Twitch siempre usa h264.
+#   youtube_resolution = 3840x2160
+#   youtube_codec = hevc
+#   twitch_resolution = 1920x1080
+# Coste: la misma resolución se captura una sola vez; la misma resolución + tasa
+# + códec se codifica una sola vez. Cada resolución distinta añade un escalado en
+# la GPU (décimas de ms) y cada combinación distinta, una codificación NVENC.
+
 # Servidores (opcional; por defecto los globales de cada servicio)
 # twitch_server = rtmp://ingest.global-contribute.live-video.net/app
 # youtube_server = rtmp://a.rtmp.youtube.com/live2
@@ -26,17 +35,19 @@ youtube_bitrate = 12000
 # Con service = custom: URL completa (RTMP o fichero para pruebas: ~/prueba.mkv)
 # url = rtmp://mi-servidor/live/clave
 
-# Grabar también en local mientras emites (opcional, usa la tasa más alta)
+# Grabar también en local mientras emites (opcional). Por defecto copia la
+# resolución, códec y tasa del destino de más calidad (y reutiliza su codificación).
+# Se puede cambiar con record_resolution / record_codec / record_bitrate.
 # record = ~/Vídeos/partida.mkv
 
 # Comprueba a dónde se va a emitir (claves ocultas):  gamestreamd config
 
 # --- Vídeo -----------------------------------------------------------------
-# Resolución del stream; "auto" = la del juego. Se escala en la GPU conservando
-# la proporción (bandas negras si hace falta).
+# Resolución por defecto de todos los destinos; "auto" = la del juego. Se escala
+# en la GPU conservando la proporción (bandas negras si hace falta).
 resolution = 1920x1080
 fps = 60
-# h264 (Twitch y YouTube). hevc sólo vale si emites únicamente a YouTube
+# Códec por defecto: h264 | hevc (hevc sólo YouTube; Twitch usa h264 siempre)
 codec = h264
 # kbps por defecto (si no pones twitch_bitrate / youtube_bitrate)
 bitrate = 6000

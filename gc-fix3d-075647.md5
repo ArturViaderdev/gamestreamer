@@ -1,0 +1,4 @@
+91f3c128ba901f3bd10f4090f5b7fe0d  test/fake_daemon.cpp
+bfb51c6b133c8fe4a654917fbd0d9260  src/common/protocol.h
+19cf6739d4123802ed5db86deb6c5e9a  src/daemon/gamestreamd.cpp
+ea1ea4442bfa8231ebb139a9f9a28259  src/daemon/camera.h

@@ -54,9 +54,17 @@ fps = 60
 hotkey = Ctrl+Shift+F9
 ```
 
-With `both` it streams to Twitch and YouTube at the same time. Video is encoded once per distinct bitrate (once in total if they match), and each destination has its own connection and network thread: if one drops or lags, the other keeps going and you get a notification. `gamestreamd config` shows where it will stream (keys masked) and warns about unknown options; `gamestreamd status` shows each destination's state while live.
+With `both` it streams to Twitch and YouTube at the same time. Each destination can have its own resolution and codec (`youtube_resolution = 3840x2160`, `youtube_codec = hevc`, `twitch_resolution = 1920x1080`; Twitch always uses H.264). Only the work that differs is done:
 
-The config is re-read every time you start streaming. To test without going live: `service = custom` and `url = ~/test.mkv`. With `record = ~/Videos/match.mkv` it also records locally while streaming.
+| Twitch vs YouTube | Images from the game | NVENC encodes |
+|---|---|---|
+| same resolution, bitrate and codec | 1 | 1 (shared) |
+| same resolution, different bitrate/codec | 1 | 2 |
+| different resolution (e.g. 4K + 1080p) | 2 (extra GPU blit, tenths of a ms) | 2 |
+
+Each destination has its own connection and network thread: if one drops or lags, the other keeps going and you get a notification. `gamestreamd config` shows where it will stream (keys masked) and warns about unknown options; `gamestreamd status` shows each destination's state while live.
+
+The config is re-read every time you start streaming. To test without going live: `service = custom` and `url = ~/test.mkv`. With `record = ~/Videos/match.mkv` it also records locally while streaming; by default it copies the highest-quality destination and reuses its encode.
 
 ## Usage
 
@@ -112,12 +120,11 @@ camera_mirror = no
 - NVIDIA only (CUDA/NVENC). For AMD/Intel the daemon's import would have to switch to VAAPI (dmabuf); the layer already works.
 - The hotkey uses X11/XWayland (`XQueryKeymap`): Proton games and most native ones work; for native Wayland games use `gamestreamd toggle` with a desktop shortcut.
 - Only one game is captured at a time, even when streaming to several destinations (the last one that connected or the one that received the hotkey).
-- Resolution is shared by all destinations (no 4K to YouTube + 1080p to Twitch at the same time yet).
 - If the game stops presenting (frozen loading screen), video pauses until the next frame.
 
 ## Testing without NVIDIA
 
-`test/fake_daemon.cpp` acts as the daemon: it imports the memory exported by the layer into another Vulkan process, reads the pixels back and saves PPM images. It was used to validate the layer with lavapipe + Xvfb + `VK_LAYER_KHRONOS_validation` (no validation errors, exactly 30.2 fps with a 30 fps target, scaling and hotkey verified).
+`test/fake_daemon.cpp` acts as the daemon: it imports the memory exported by the layer into another Vulkan process, reads the pixels back and saves PPM images. It was used to validate the layer with lavapipe + Xvfb + `VK_LAYER_KHRONOS_validation` (no validation errors, exactly 30 fps with a 30 fps target, scaling, two simultaneous output resolutions and hotkey verified).
 
 ```sh
 g++ -O1 -o build/fake_daemon test/fake_daemon.cpp -lvulkan
@@ -183,9 +190,17 @@ fps = 60
 hotkey = Ctrl+Shift+F9
 ```
 
-Con `ambos` se emite a Twitch y YouTube a la vez. El vídeo se codifica una vez por cada tasa de bits distinta (con la misma tasa, una sola vez) y cada destino tiene su propia conexión e hilo de red: si uno se cae o va lento, el otro sigue y recibes una notificación. `gamestreamd config` muestra a dónde se va a emitir (con las claves ocultas) y avisa de opciones desconocidas; `gamestreamd status` el estado de cada destino durante la emisión.
+Con `ambos` se emite a Twitch y YouTube a la vez. Cada destino puede tener su resolución y su códec (`youtube_resolution = 3840x2160`, `youtube_codec = hevc`, `twitch_resolution = 1920x1080`; Twitch usa siempre H.264). Sólo se hace el trabajo que difiere:
 
-Se relee cada vez que empiezas a emitir. Para probar sin emitir: `service = custom` y `url = ~/prueba.mkv`. Con `record = ~/Vídeos/partida.mkv` además graba en local mientras emite.
+| Twitch vs YouTube | Imágenes desde el juego | Codificaciones NVENC |
+|---|---|---|
+| misma resolución, tasa y códec | 1 | 1 (compartida) |
+| misma resolución, distinta tasa/códec | 1 | 2 |
+| distinta resolución (p. ej. 4K + 1080p) | 2 (un blit más en la GPU, décimas de ms) | 2 |
+
+Cada destino tiene su propia conexión e hilo de red: si uno se cae o va lento, el otro sigue y recibes una notificación. `gamestreamd config` muestra a dónde se va a emitir (con las claves ocultas) y avisa de opciones desconocidas; `gamestreamd status` el estado de cada destino durante la emisión.
+
+Se relee cada vez que empiezas a emitir. Para probar sin emitir: `service = custom` y `url = ~/prueba.mkv`. Con `record = ~/Vídeos/partida.mkv` además graba en local mientras emite; por defecto copia el destino de más calidad y reutiliza su codificación.
 
 ### Uso
 
@@ -233,7 +248,7 @@ camera_mirror = no
 ```
 
 - **Micrófono**: se captura en su propio hilo, con su propia corrección de reloj, y se mezcla con el audio del juego (cada uno con su volumen). Con `audio = none` sólo se emite el micrófono. Usa auriculares para que el micro no recoja el sonido del juego.
-- **Cámara**: se lee directamente con V4L2 (YUYV o MJPEG), se escala en CPU al tamaño pequeño (≈1,5-4 ms por frame) y se copia a la esquina del frame en VRAM justo antes de NVENC. El juego no se ve afectado. Si la cámara no está, está ocupada por otro programa o se desconecta, el directo sigue sin ella y se reintenta cada 3 s.
+- **Cámara**: se lee directamente con V4L2 (YUYV o MJPEG), se escala en CPU al tamaño pequeño (≈1,5-4 ms por frame) y se copia a la esquina del frame en VRAM justo antes de NVENC. El juego no se ve afectado. Con juegos 3D lado a lado (la capa 3D Vision) la cámara se pone en la misma esquina de los dos ojos, a la profundidad de la pantalla y con su proporción correcta en half SBS; `camera_size` es entonces el % del ancho de un ojo. Si la cámara no está, está ocupada por otro programa o se desconecta, el directo sigue sin ella y se reintenta cada 3 s.
 - `gamestreamd config` muestra si están activados.
 
 ### Limitaciones actuales
@@ -241,12 +256,11 @@ camera_mirror = no
 - Sólo NVIDIA (CUDA/NVENC). Para AMD/Intel habría que cambiar la importación por VAAPI (dmabuf) en el daemon; la capa ya sirve.
 - El hotkey usa X11/XWayland (`XQueryKeymap`): los juegos Proton y la mayoría de nativos funcionan; en juegos Wayland nativos usa `gamestreamd toggle` con un atajo del escritorio.
 - Sólo se captura un juego a la vez, aunque se emita a varios destinos (el último que se conectó o el que recibió el hotkey).
-- La resolución es la misma para todos los destinos (todavía no se puede 4K a YouTube + 1080p a Twitch a la vez).
 - Si el juego deja de presentar (pantalla de carga congelada), el vídeo se detiene hasta el siguiente frame.
 
 ### Prueba sin NVIDIA
 
-`test/fake_daemon.cpp` hace de daemon, importa la memoria exportada por la capa en otro proceso Vulkan, lee los píxeles y guarda PPM. Se usó para validar la capa con lavapipe + Xvfb + `VK_LAYER_KHRONOS_validation` (sin errores de validación, 30,2 fps exactos con objetivo 30, escalado y hotkey verificados).
+`test/fake_daemon.cpp` hace de daemon, importa la memoria exportada por la capa en otro proceso Vulkan, lee los píxeles y guarda PPM. Se usó para validar la capa con lavapipe + Xvfb + `VK_LAYER_KHRONOS_validation` (sin errores de validación, 30 fps exactos con objetivo 30, escalado, dos resoluciones de salida a la vez y hotkey verificados).
 
 ```sh
 g++ -O1 -o build/fake_daemon test/fake_daemon.cpp -lvulkan

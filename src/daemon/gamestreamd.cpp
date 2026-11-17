@@ -124,10 +124,14 @@ struct Dest {
     std::string name;   // "Twitch", "YouTube", "Grabación"...
     std::string url;    // rtmp://... o ruta de fichero
     int bitrate;        // kbps
+    uint32_t w = 0, h = 0;      // resolución de este destino (0x0 = la del juego)
+    std::string codec = "h264";
+    int stream = 0;             // índice de la salida de la capa que usa (misma resolución = misma salida)
 };
 
 struct Config {
     std::vector<Dest> dests;  // a dónde se emite (uno o varios a la vez)
+    std::vector<std::pair<uint32_t, uint32_t>> streams;   // resoluciones distintas que se piden a la capa
     uint32_t width = 1920, height = 1080;   // 0x0 = resolución del juego
     uint32_t fps = 60;
     std::string codec = "h264";
@@ -166,6 +170,26 @@ static Config loadConfig() {
     auto num = [&](const char* k, int def) { return m.count(k) && !m[k].empty() ? atoi(m[k].c_str()) : def; };
 
     c.bitrate = num("bitrate", 6000);
+    c.codec = get("codec", "h264");
+    auto parseRes = [](const std::string& v, uint32_t& w, uint32_t& h) {
+        if (v == "auto" || v == "native" || v == "nativa") { w = h = 0; return; }
+        if (sscanf(v.c_str(), "%ux%u", &w, &h) != 2) { w = 1920; h = 1080; }
+    };
+    parseRes(get("resolution", "1920x1080"), c.width, c.height);
+    // Cada destino puede tener su resolución y su códec (por defecto, los globales)
+    auto dest = [&](const std::string& name, const std::string& prefix, const std::string& url, int bitrate) {
+        Dest d;
+        d.name = name;
+        d.url = url;
+        d.bitrate = bitrate;
+        d.w = c.width; d.h = c.height;
+        std::string r = get((prefix + "_resolution").c_str(), "");
+        if (!r.empty()) parseRes(r, d.w, d.h);
+        d.codec = get((prefix + "_codec").c_str(), c.codec);
+        if (d.codec != "h264" && d.codec != "hevc") d.codec = "h264";
+        return d;
+    };
+
     std::string service = get("service", "custom");
     for (auto& ch : service) ch = (char)tolower((unsigned char)ch);
     const bool both = service == "ambos" || service == "both" || service == "todos" || service == "all";
@@ -178,32 +202,56 @@ static Config loadConfig() {
         std::string srv = get("twitch_server", (tw && !yt) ? get("server", "") : "");
         if (srv.empty()) srv = "rtmp://ingest.global-contribute.live-video.net/app";
         if (k.empty()) LOG("AVISO: falta twitch_key en la configuración");
-        else c.dests.push_back({"Twitch", srv + "/" + k, num("twitch_bitrate", c.bitrate)});
+        else {
+            Dest d = dest("Twitch", "twitch", srv + "/" + k, num("twitch_bitrate", c.bitrate));
+            if (d.codec != "h264") {   // Twitch sólo admite H.264 por RTMP
+                if (m.count("twitch_codec")) LOG("AVISO: Twitch sólo admite H.264 por RTMP: se usa h264 para Twitch");
+                d.codec = "h264";
+            }
+            c.dests.push_back(d);
+        }
     }
     if (yt) {
         std::string k = get("youtube_key", (yt && !tw) ? key : "");
         std::string srv = get("youtube_server", (yt && !tw) ? get("server", "") : "");
         if (srv.empty()) srv = "rtmp://a.rtmp.youtube.com/live2";
         if (k.empty()) LOG("AVISO: falta youtube_key en la configuración");
-        else c.dests.push_back({"YouTube", srv + "/" + k, num("youtube_bitrate", c.bitrate)});
+        else c.dests.push_back(dest("YouTube", "youtube", srv + "/" + k, num("youtube_bitrate", c.bitrate)));
     }
     if (!tw && !yt) {
         std::string url = get("url", "");
-        if (!url.empty()) c.dests.push_back({"Destino", expandHome(url), c.bitrate});
+        if (!url.empty()) c.dests.push_back(dest("Destino", "custom", expandHome(url), c.bitrate));
     }
     std::string rec = get("record", "");
     if (!rec.empty()) {
-        int best = c.bitrate;
-        for (auto& d : c.dests) best = std::max(best, d.bitrate);
-        c.dests.push_back({"Grabación", expandHome(rec), num("record_bitrate", best)});
+        // Por defecto la grabación copia al destino de más calidad: así reutiliza su codificación
+        Dest best = dest("Grabación", "record", expandHome(rec), c.bitrate);
+        const Dest* top = nullptr;
+        for (auto& d : c.dests)
+            if (!top || (uint64_t)d.w * d.h > (uint64_t)top->w * top->h ||
+                ((uint64_t)d.w * d.h == (uint64_t)top->w * top->h && d.bitrate > top->bitrate)) top = &d;
+        if (top) {
+            if (!m.count("record_resolution")) { best.w = top->w; best.h = top->h; }
+            if (!m.count("record_codec")) best.codec = top->codec;
+            best.bitrate = top->bitrate;
+        }
+        best.bitrate = num("record_bitrate", best.bitrate);
+        c.dests.push_back(best);
+    }
+    // Resoluciones distintas -> salidas de la capa (la misma resolución se comparte)
+    for (auto& d : c.dests) {
+        int idx = -1;
+        for (size_t i = 0; i < c.streams.size(); i++)
+            if (c.streams[i].first == d.w && c.streams[i].second == d.h) idx = (int)i;
+        if (idx < 0 && c.streams.size() < GS_MAX_STREAMS) {
+            c.streams.push_back({d.w, d.h});
+            idx = (int)c.streams.size() - 1;
+        }
+        d.stream = idx < 0 ? 0 : idx;
     }
 
-    std::string res = get("resolution", "1920x1080");
-    if (res == "auto" || res == "native") c.width = c.height = 0;
-    else if (sscanf(res.c_str(), "%ux%u", &c.width, &c.height) != 2) c.width = 1920, c.height = 1080;
     c.fps = (uint32_t)num("fps", 60);
     if (c.fps < 1 || c.fps > 240) c.fps = 60;
-    c.codec = get("codec", "h264");
     c.keyint = num("keyint", 2);
     c.preset = get("preset", "p4");
     c.audio = get("audio", "auto");
@@ -656,8 +704,7 @@ public:
         for (auto& s : sinks_) if (!s->failed) return false;
         return true;   // todos los destinos han fallado
     }
-    int width() const { return w_; }
-    int height() const { return h_; }
+    const std::vector<std::pair<int, int>>& sizes() const { return sizes_; }
     int stereo() const { return stereo_; }
     std::string startErrors;   // destinos que no conectaron al empezar
     std::string failedNames() const {
@@ -676,26 +723,32 @@ public:
         return r;
     }
 
-    bool open(const Config& cfg, int w, int h, int stereo = 0) {
+    // sizes: tamaño real de cada salida de la capa (las "auto" ya resueltas)
+    bool open(const Config& cfg, const std::vector<std::pair<int, int>>& sizes, int stereo = 0) {
         cfg_ = cfg;
-        w_ = w; h_ = h;
+        sizes_ = sizes;
         stereo_ = stereo;
         encFailed_ = false;
         startErrors.clear();
         if (cfg.dests.empty()) { LOG("no hay destino: configura service y las claves en %s", gs::configPath().c_str()); return false; }
 
-        // Un codificador NVENC por cada tasa de bits distinta
+        // Un codificador NVENC por cada combinación distinta de (resolución, tasa de bits, códec)
         std::vector<int> sinkEnc;
         for (auto& d : cfg.dests) {
             int idx = -1;
-            for (size_t i = 0; i < rates_.size(); i++) if (rates_[i] == d.bitrate) idx = (int)i;
+            for (size_t i = 0; i < encs_.size(); i++)
+                if (encStream_[i] == d.stream && rates_[i] == d.bitrate && codecs_[i] == d.codec) idx = (int)i;
             if (idx < 0) {
+                if (d.stream >= (int)sizes.size()) { LOG("%s: salida %d inexistente", d.name.c_str(), d.stream); close(); return false; }
                 auto e = std::make_unique<NvEnc>();
                 Config c = cfg;
                 c.bitrate = d.bitrate;
-                if (!e->open(c, w, h)) { close(); return false; }
+                c.codec = d.codec;
+                if (!e->open(c, sizes[d.stream].first, sizes[d.stream].second)) { close(); return false; }
                 encs_.push_back(std::move(e));
+                encStream_.push_back(d.stream);
                 rates_.push_back(d.bitrate);
+                codecs_.push_back(d.codec);
                 idx = (int)encs_.size() - 1;
             }
             sinkEnc.push_back(idx);
@@ -715,7 +768,7 @@ public:
             co.border = cfg.camBorder;
             co.mirror = cfg.camMirror;
             co.stereo = stereo;
-            overlays_.push_back(std::make_unique<CameraOverlay>(co, w, h));
+            overlays_.push_back(std::make_unique<CameraOverlay>(co, sizes));
         }
 
         for (size_t i = 0; i < cfg.dests.size(); i++) {
@@ -735,21 +788,24 @@ public:
         open_ = true;
         for (auto& s : sinks_) s->thr = std::thread(&Output::writerLoop, this, s.get());
         if (haveAudio_) startAudio();
-        std::string rates;
-        for (int r : rates_) rates += (rates.empty() ? "" : "/") + std::to_string(r);
-        LOG("emitiendo %dx%d @ %u fps, %s %s kbps -> %s", w, h, cfg.fps, cfg.codec == "hevc" ? "HEVC" : "H.264",
-            rates.c_str(), summary().c_str());
+        for (auto& sk : sinks_) {
+            int e = sk->enc;
+            LOG("emitiendo %dx%d @ %u fps, %s %d kbps -> %s", sizes_[encStream_[e]].first, sizes_[encStream_[e]].second,
+                cfg.fps, codecs_[e] == "hevc" ? "HEVC" : "H.264", rates_[e], sk->name.c_str());
+        }
+        LOG("%zu imagen(es) desde el juego, %zu codificación(es) NVENC, %zu destino(s)", sizes_.size(), encs_.size(), sinks_.size());
         return true;
     }
 
     // Copia el frame del juego (en VRAM, importado de Vulkan) a cada
     // codificador y lo codifica. released() se llama tras las copias.
-    void video(CUdeviceptr src, uint32_t pitch, uint64_t tsNs, const std::function<void()>& released) {
+    // src/pitch: un buffer por salida de la capa (misma VRAM del juego)
+    void video(const CUdeviceptr* src, const uint32_t* pitch, uint64_t tsNs, const std::function<void()>& released) {
         int64_t pts = (int64_t)(tsNs / 1000) - (int64_t)t0_;
         if (pts < 0) { released(); return; }
         if (pts <= lastVPts_) pts = lastVPts_ + 1;
         lastVPts_ = pts;
-        for (auto& e : encs_) e->upload(src, pitch, overlays_);
+        for (size_t i = 0; i < encs_.size(); i++) encs_[i]->upload(src[encStream_[i]], pitch[encStream_[i]], overlays_);
 #ifndef GS_FAKE_ENC
         g_cuda.push();
         g_cuda.cuStreamSynchronize(nullptr);
@@ -797,6 +853,9 @@ public:
         encs_.clear();
         overlays_.clear();   // para la cámara
         rates_.clear();
+        encStream_.clear();
+        codecs_.clear();
+        sizes_.clear();
         avcodec_free_context(&aenc_);
         stopAudio();
         haveAudio_ = false;
@@ -837,9 +896,9 @@ private:
         s.vst = avformat_new_stream(s.oc, nullptr);
         auto* vp = s.vst->codecpar;
         vp->codec_type = AVMEDIA_TYPE_VIDEO;
-        vp->codec_id = cfg_.codec == "hevc" ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
-        vp->width = w_;
-        vp->height = h_;
+        vp->codec_id = codecs_[enc] == "hevc" ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+        vp->width = sizes_[encStream_[enc]].first;
+        vp->height = sizes_[encStream_[enc]].second;
         vp->bit_rate = (int64_t)rates_[enc] * 1000;
         vp->extradata = (uint8_t*)av_mallocz(e.header.size() + AV_INPUT_BUFFER_PADDING_SIZE);
         memcpy(vp->extradata, e.header.data(), e.header.size());
@@ -1094,6 +1153,9 @@ private:
 
     std::vector<std::unique_ptr<NvEnc>> encs_;
     std::vector<int> rates_;
+    std::vector<int> encStream_;          // salida de la capa que usa cada codificador
+    std::vector<std::string> codecs_;
+    std::vector<std::pair<int, int>> sizes_;
     std::vector<uint8_t> bits_;
     std::vector<std::unique_ptr<Overlay>> overlays_;
     int stereo_ = 0;
@@ -1116,9 +1178,11 @@ struct Client {
     std::string exe = "?";
     uint64_t connectedAt = 0;
     // texturas importadas
-    uint32_t gen = 0, nslots = 0, w = 0, h = 0, pitch = 0;
-    CUexternalMemory ext[GS_MAX_SLOTS]{};
-    CUdeviceptr ptr[GS_MAX_SLOTS]{};
+    uint32_t gen = 0, nslots = 0, nstreams = 0;
+    uint32_t pitch[GS_MAX_STREAMS]{};
+    // [slot * GS_MAX_STREAMS + salida]
+    CUexternalMemory ext[GS_MAX_SLOTS * GS_MAX_STREAMS]{};
+    CUdeviceptr ptr[GS_MAX_SLOTS * GS_MAX_STREAMS]{};
 };
 
 class Daemon {
@@ -1210,7 +1274,7 @@ private:
 
     bool readClient(Client* c) {
         char buf[GS_MAX_MSG];
-        char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS)];
+        char cbuf[CMSG_SPACE(sizeof(int) * GS_MAX_SLOTS * GS_MAX_STREAMS)];
         iovec iov{buf, sizeof buf};
         msghdr mh{};
         mh.msg_iov = &iov;
@@ -1241,7 +1305,7 @@ private:
             break;
         }
         case GS_TEXTURES:
-            if ((size_t)n >= offsetof(GsTextures, stereo)) {   // las capas anteriores no mandan "stereo"
+            if ((size_t)n >= offsetof(GsTextures, stereo)) {   // "stereo" sólo lo manda la capa 3D Vision
                 GsTextures t{};
                 memcpy(&t, buf, std::min((size_t)n, sizeof t));
                 if (t.stereo > 2) t.stereo = 0;
@@ -1274,7 +1338,7 @@ private:
     void releaseImports(Client* c) {
         if (!c->nslots || !g_cuda.ctx) { c->nslots = 0; return; }
         g_cuda.push();
-        for (uint32_t i = 0; i < c->nslots; i++) {
+        for (uint32_t i = 0; i < GS_MAX_SLOTS * GS_MAX_STREAMS; i++) {
             if (c->ptr[i]) g_cuda.cuMemFree(c->ptr[i]);
             if (c->ext[i]) g_cuda.cuDestroyExternalMemory(c->ext[i]);
             c->ptr[i] = 0;
@@ -1286,22 +1350,31 @@ private:
 
     void onTextures(Client* c, const GsTextures& t, std::vector<int>& fds) {
         releaseImports(c);
-        if (c != active_ || fds.size() != t.nslots || t.nslots > GS_MAX_SLOTS) return;
+        if (c != active_) return;
+        if (t.version != GS_PROTO_VERSION) {
+            failStart("La capa Vulkan es de otra versión: reinstala gamestream y reinicia el juego");
+            return;
+        }
+        if (t.nslots > GS_MAX_SLOTS || t.nstreams < 1 || t.nstreams > GS_MAX_STREAMS || fds.size() != t.nslots * t.nstreams) return;
         if (!g_cuda.ensure(t.has_uuid, t.device_uuid)) { failStart("CUDA/NVENC: " + lastError()); return; }
         g_cuda.push();
         bool ok = true;
-        for (uint32_t i = 0; i < t.nslots; i++) {
-            CUDA_EXTERNAL_MEMORY_HANDLE_DESC d{};
-            d.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
-            d.handle.fd = fds[i];
-            d.size = t.alloc_size;
-            d.flags = t.dedicated ? CUDA_EXTERNAL_MEMORY_DEDICATED : 0;
-            if (ok && g_cuda.cuImportExternalMemory(&c->ext[i], &d) == CUDA_SUCCESS) {
-                fds[i] = -1;   // ahora es de CUDA
-                CUDA_EXTERNAL_MEMORY_BUFFER_DESC b{};
-                b.size = (unsigned long long)t.pitch * t.height;
-                if (g_cuda.cuExternalMemoryGetMappedBuffer(&c->ptr[i], c->ext[i], &b) != CUDA_SUCCESS) ok = false;
-            } else ok = false;
+        for (uint32_t i = 0; i < t.nslots && ok; i++) {
+            for (uint32_t k = 0; k < t.nstreams && ok; k++) {
+                int& fd = fds[i * t.nstreams + k];
+                const uint32_t idx = i * GS_MAX_STREAMS + k;
+                CUDA_EXTERNAL_MEMORY_HANDLE_DESC d{};
+                d.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+                d.handle.fd = fd;
+                d.size = t.alloc_size[k];
+                d.flags = t.dedicated ? CUDA_EXTERNAL_MEMORY_DEDICATED : 0;
+                if (g_cuda.cuImportExternalMemory(&c->ext[idx], &d) == CUDA_SUCCESS) {
+                    fd = -1;   // ahora es de CUDA
+                    CUDA_EXTERNAL_MEMORY_BUFFER_DESC b{};
+                    b.size = (unsigned long long)t.pitch[k] * t.height[k];
+                    if (g_cuda.cuExternalMemoryGetMappedBuffer(&c->ptr[idx], c->ext[idx], &b) != CUDA_SUCCESS) ok = false;
+                } else ok = false;
+            }
         }
         g_cuda.pop();
         for (int& fd : fds) if (fd >= 0) close(fd);
@@ -1309,13 +1382,16 @@ private:
         c->nslots = t.nslots;
         if (!ok) { releaseImports(c); failStart("No se pudo importar la memoria del juego en CUDA"); return; }
         c->gen = t.generation;
-        c->w = t.width; c->h = t.height; c->pitch = t.pitch;
+        c->nstreams = t.nstreams;
+        std::vector<std::pair<int, int>> sizes;
+        for (uint32_t k = 0; k < t.nstreams; k++) {
+            c->pitch[k] = t.pitch[k];
+            sizes.push_back({(int)t.width[k], (int)t.height[k]});
+        }
 
-        if (out_.isOpen() && (out_.width() != (int)t.width || out_.height() != (int)t.height ||
-                              out_.stereo() != (int)t.stereo))
-            out_.close();
+        if (out_.isOpen() && (out_.sizes() != sizes || out_.stereo() != (int)t.stereo)) out_.close();
         if (!out_.isOpen()) {
-            if (!out_.open(cfg_, (int)t.width, (int)t.height, (int)t.stereo)) { failStart("No se pudo iniciar: " + lastError()); return; }
+            if (!out_.open(cfg_, sizes, (int)t.stereo)) { failStart("No se pudo iniciar: " + lastError()); return; }
             notify(cfg_, "EN DIRECTO (" + out_.summary() + "): " + c->exe +
                              (out_.startErrors.empty() ? "" : ". No conectó: " + out_.startErrors));
         }
@@ -1323,10 +1399,11 @@ private:
 
     void onFrame(Client* c, const GsFrame& f) {
         GsRelease rel{GS_RELEASE, f.generation, f.slot};
-        if (c == active_ && out_.isOpen() && f.generation == c->gen && f.slot < c->nslots && c->ptr[f.slot])
-            out_.video(c->ptr[f.slot], c->pitch, f.ts_ns, [&] { sendTo(c, &rel, sizeof rel); });
-        else
+        if (c == active_ && out_.isOpen() && f.generation == c->gen && f.slot < c->nslots && c->ptr[f.slot * GS_MAX_STREAMS]) {
+            out_.video(&c->ptr[f.slot * GS_MAX_STREAMS], c->pitch, f.ts_ns, [&] { sendTo(c, &rel, sizeof rel); });
+        } else {
             sendTo(c, &rel, sizeof rel);
+        }
     }
 
     Client* pickGame(Client* hint) {
@@ -1347,7 +1424,15 @@ private:
         Client* g = pickGame(hint);
         if (!g) { LOG("no hay ningún juego Vulkan conectado"); return false; }
         active_ = g;
-        GsStart s{GS_START, cfg_.width, cfg_.height, cfg_.fps};
+        GsStart s{};
+        s.type = GS_START;
+        s.version = GS_PROTO_VERSION;
+        s.fps = cfg_.fps;
+        s.nstreams = (uint32_t)cfg_.streams.size();
+        for (size_t k = 0; k < cfg_.streams.size(); k++) {
+            s.width[k] = cfg_.streams[k].first;
+            s.height[k] = cfg_.streams[k].second;
+        }
         sendTo(g, &s, sizeof s);
         LOG("iniciando emisión de %s...", g->exe.c_str());
         return true;
@@ -1461,7 +1546,9 @@ static int showConfig() {
                                   "audio_bitrate", "audio_delay", "audio_volume", "microphone", "microphone_device",
                                   "microphone_volume", "camera", "camera_device", "camera_capture", "camera_fps",
                                   "camera_size", "camera_position", "camera_margin", "camera_border", "camera_mirror",
-                                  "hotkey", "notify"};
+                                  "hotkey", "notify", "twitch_resolution", "youtube_resolution",
+                                  "record_resolution", "custom_resolution", "twitch_codec", "youtube_codec",
+                                  "record_codec", "custom_codec"};
     for (auto& kv : gs::loadConfig(gs::configPath())) {
         bool ok = false;
         for (auto k : known) ok |= kv.first == k;
@@ -1473,11 +1560,11 @@ static int showConfig() {
         size_t k = u.rfind('/');
         if (u.rfind("rtmp", 0) == 0 && k != std::string::npos && u.size() - k > 5)
             u = u.substr(0, k + 1) + u.substr(k + 1, 4) + std::string(u.size() - k - 5, '*');
-        printf("  %-10s %5d kbps  %s\n", d.name.c_str(), d.bitrate, u.c_str());
+        std::string res = d.w ? std::to_string(d.w) + "x" + std::to_string(d.h) : "auto";
+        printf("  %-10s %-9s %-4s %5d kbps  %s\n", d.name.c_str(), res.c_str(), d.codec.c_str(), d.bitrate, u.c_str());
     }
-    printf("  vídeo: %s %s @ %u fps, preset %s | audio: %s %d kbps\n",
-           c.width ? (std::to_string(c.width) + "x" + std::to_string(c.height)).c_str() : "auto",
-           c.codec.c_str(), c.fps, c.preset.c_str(), c.audio.c_str(), c.audioBitrate);
+    printf("  %zu imagen(es) distinta(s) desde el juego @ %u fps, preset %s | audio: %s %d kbps\n",
+           c.streams.size(), c.fps, c.preset.c_str(), c.audio.c_str(), c.audioBitrate);
     printf("  micrófono: %s", c.microphone ? "sí" : "no");
     if (c.microphone) printf(" (%s, volumen %d%%)", c.micDevice.c_str(), c.micVolume);
     printf(" | cámara: %s", c.camera ? "sí" : "no");
@@ -1500,11 +1587,16 @@ int main(int argc, char** argv) {
             avformat_network_init();
             av_log_set_callback(ffLogCb);
             Output o;
-            if (!o.open(loadConfig(), 640, 360)) return 1;
+            Config tc = loadConfig();
+            std::vector<std::pair<int, int>> sizes;
+            for (auto& st : tc.streams) sizes.push_back({st.first ? (int)st.first : 640, st.second ? (int)st.second : 360});
+            if (!o.open(tc, sizes)) return 1;
+            CUdeviceptr ptrs[GS_MAX_STREAMS] = {};
+            uint32_t pitches[GS_MAX_STREAMS] = {};
             int secs = argc > 2 ? atoi(argv[2]) : 5;
             for (int i = 0; i < secs * 30; i++) {
                 timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                o.video(0, 0, (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec, [] {});
+                o.video(ptrs, pitches, (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec, [] {});
                 usleep(33333);
                 if (i % 60 == 59) LOG("%s", o.stats().c_str());
             }
